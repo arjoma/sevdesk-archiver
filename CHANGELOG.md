@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `archive --api-token` CLI flag as an alternative to `SEVDESK_API_TOKEN` / `.env`.
+
+### Changed
+- README: lead with `uvx sevdesk-archiver@latest`; document env vars, CLI args, and `.env` as three equivalent ways to configure. Add project badges (PyPI, CI, Python version, License).
+- Release workflow: upload only `*.whl` and `*.tar.gz` to GitHub Releases (dotfiles like `.gitignore` no longer appear as release assets).
+
+### Fixed
+- `.env` lookup now starts from the current working directory, so `uvx sevdesk-archiver@latest` picks up a `.env` next to where the user runs it. Previously `load_dotenv()` searched from the installed package path, so only a `.env` alongside the source was ever found.
+
 ## [0.1.0] - 2026-04-21
 
 First public release.

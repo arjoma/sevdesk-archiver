@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import unittest
+from unittest.mock import patch
 
 from click.testing import CliRunner
 
@@ -358,6 +359,45 @@ class TestVerifyArchive(unittest.TestCase):
         with open(os.path.join(self.files, "inv-1.json"), encoding="utf-8") as f:
             meta = json.load(f)
         self.assertEqual(meta["pdf_hash"], "sha256:existing")
+
+    def test_cli_archive_accepts_api_token_flag(self):
+        """--api-token bypasses the SEVDESK_API_TOKEN env requirement."""
+        runner = CliRunner()
+        with patch("sevdesk_archiver.cli.SevDeskClient") as MockClient:
+            MockClient.return_value.get_invoices.return_value = []
+            MockClient.return_value.get_credit_notes.return_value = []
+            MockClient.return_value.get_vouchers.return_value = []
+            env = {k: v for k, v in os.environ.items() if k != "SEVDESK_API_TOKEN"}
+            with patch.dict(os.environ, env, clear=True), patch(
+                "sevdesk_archiver.cli.find_dotenv", return_value=""
+            ):
+                result = runner.invoke(
+                    cli,
+                    [
+                        "archive",
+                        "--target",
+                        self.tmp,
+                        "--api-token",
+                        "test-token",
+                        "--after",
+                        "2026-02-01",
+                        "--end",
+                        "2026-02-28",
+                        "--dry-run",
+                    ],
+                )
+        self.assertEqual(result.exit_code, 0, result.output)
+        MockClient.assert_called_once_with(api_token="test-token")
+
+    def test_cli_archive_errors_without_token(self):
+        runner = CliRunner()
+        env = {k: v for k, v in os.environ.items() if k != "SEVDESK_API_TOKEN"}
+        with patch.dict(os.environ, env, clear=True), patch(
+            "sevdesk_archiver.cli.find_dotenv", return_value=""
+        ):
+            result = runner.invoke(cli, ["archive", "--target", self.tmp])
+        self.assertNotEqual(result.exit_code, 0, result.output)
+        self.assertIn("SEVDESK_API_TOKEN", result.output)
 
     def test_backfill_skips_no_pdf_sidecar(self):
         self._write_sidecar(

@@ -4,7 +4,7 @@ import os
 import sys
 
 import click
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
 from . import archive as archive_mod
 from .sevdesk import SevDeskClient
@@ -25,12 +25,13 @@ def _resolve_target(target: str | None) -> str:
     return os.path.expanduser(os.path.expandvars(target_dir))
 
 
-def _require_token() -> str:
-    token = os.getenv("SEVDESK_API_TOKEN")
+def _require_token(override: str | None = None) -> str:
+    token = override or os.getenv("SEVDESK_API_TOKEN")
     if not token:
         click.echo(
             click.style(
-                "Error: SEVDESK_API_TOKEN is not set. Put it in .env or export it.",
+                "Error: SEVDESK_API_TOKEN is not set. Pass --api-token, export it, "
+                "or put it in a .env file.",
                 fg="red",
             ),
             err=True,
@@ -45,14 +46,20 @@ def _require_token() -> str:
 @click.version_option(package_name="sevdesk-archiver", prog_name="sevdesk-archiver")
 def cli(log_file, verbose):
     """SevDesk Archiver — build and serve a local archive of SevDesk documents."""
-    load_dotenv()
+    load_dotenv(find_dotenv(usecwd=True))
     level = logging.DEBUG if verbose else logging.INFO
     final_log_file = log_file or os.getenv("SEVDESK_ARCHIVER_LOG_FILE")
     setup_logging(final_log_file, level=level)
 
 
 @cli.command()
-@click.option("--target", help="Archive directory (default: $ARCHIVE_TARGET)")
+@click.option("--target", help="Archive directory (default: $ARCHIVE_TARGET, or '.' falls back to the current directory)")
+@click.option(
+    "--api-token",
+    "api_token",
+    envvar="SEVDESK_API_TOKEN",
+    help="SevDesk API token (default: $SEVDESK_API_TOKEN)",
+)
 @click.option("--after", help="Start date YYYY-MM-DD (default: 1st of previous month)")
 @click.option("--end", "end_date", help="End date YYYY-MM-DD (default: today)")
 @click.option(
@@ -77,7 +84,7 @@ def cli(log_file, verbose):
     is_flag=True,
     help="Show what would be downloaded without writing files",
 )
-def archive(target, after, end_date, status, credit_notes, vouchers, dry_run):
+def archive(target, api_token, after, end_date, status, credit_notes, vouchers, dry_run):
     """Build an idempotent local archive of SevDesk documents.
 
     Each document gets a PDF plus a JSON sidecar with full metadata. Re-running
@@ -85,7 +92,7 @@ def archive(target, after, end_date, status, credit_notes, vouchers, dry_run):
     HTML viewer. Drafts (non-sent documents) are never archived.
     """
     target_dir = _resolve_target(target)
-    token = _require_token()
+    token = _require_token(api_token)
 
     client = SevDeskClient(api_token=token)
 
