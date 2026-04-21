@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>SevDesk Archiv</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #fff; --border: #e5e4df;
+    --text: #1a1a1a; --text-2: #666; --accent: #2563eb;
+  }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.45 -apple-system, system-ui, sans-serif; margin: 0;
+    background: var(--bg); color: var(--text); }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--border);
+    background: var(--panel); display: flex; justify-content: space-between; align-items: center; }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  header .meta { color: var(--text-2); font-size: 13px; }
+  main { padding: 16px 24px; }
+  .filters { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+  .filters input, .filters select { padding: 6px 10px; border: 1px solid var(--border);
+    border-radius: 4px; background: var(--panel); font: inherit; }
+  .filters input[type="search"] { min-width: 260px; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { background: #fafaf8; font-weight: 600; user-select: none; cursor: pointer; }
+  th:hover { background: #f0efe9; }
+  tbody tr:hover { background: #faf9f6; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.muted { color: var(--text-2); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; background: #eee; color: #333; }
+  .badge.Invoice { background: #dbeafe; color: #1e40af; }
+  .badge.CreditNote { background: #fef3c7; color: #92400e; }
+  .badge.Voucher { background: #dcfce7; color: #166534; }
+  .empty { padding: 48px 24px; text-align: center; color: var(--text-2); }
+  footer { padding: 12px 24px; color: var(--text-2); font-size: 12px;
+    border-top: 1px solid var(--border); background: var(--panel); }
+</style>
+</head>
+<body>
+<header>
+  <h1>SevDesk Archiv</h1>
+  <div class="meta" id="meta">Lade manifest.json&hellip;</div>
+</header>
+<main>
+  <div class="filters">
+    <input type="search" id="q" placeholder="Suche (Nummer, Empf&auml;nger, Typ&hellip;)" autofocus>
+    <select id="type">
+      <option value="">Alle Typen</option>
+      <option>Invoice</option>
+      <option>CreditNote</option>
+      <option>Voucher</option>
+    </select>
+    <select id="year">
+      <option value="">Alle Jahre</option>
+    </select>
+  </div>
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th data-k="date">Datum</th>
+        <th data-k="type">Typ</th>
+        <th data-k="number">Nummer</th>
+        <th data-k="receiver">Empf&auml;nger / Lieferant</th>
+        <th data-k="status_label">Status</th>
+        <th data-k="gross" class="num">Brutto</th>
+        <th>PDF</th>
+        <th>JSON</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+  <div class="empty" id="empty" hidden>Keine Eintr&auml;ge gefunden.</div>
+</main>
+<footer>
+  Erzeugt von <a href="https://github.com/haraldschilly/sevdesk-archiver">sevdesk-archiver</a>.
+  Dieser einfache Viewer wird &uuml;ber <code>python3 serve.py</code> bereitgestellt.
+</footer>
+<script>
+(function () {
+  const $ = (s) => document.querySelector(s);
+  const tbody = $("#tbl tbody");
+  const meta = $("#meta");
+  const empty = $("#empty");
+  const q = $("#q"), typeSel = $("#type"), yearSel = $("#year");
+
+  let entries = [];
+  let sortKey = "date";
+  let sortDir = -1;
+
+  function fmtMoney(v, cur) {
+    if (v === null || v === undefined || v === "") return "";
+    const n = Number(v);
+    if (Number.isNaN(n)) return String(v);
+    return n.toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+      + (cur ? " " + cur : "");
+  }
+
+  function render() {
+    const term = q.value.trim().toLowerCase();
+    const t = typeSel.value;
+    const y = yearSel.value;
+    const rows = entries.filter((e) => {
+      if (t && e.type !== t) return false;
+      if (y && String(e.year) !== y) return false;
+      if (!term) return true;
+      const hay = [e.number, e.receiver, e.type, e.status_label, e.invoice_type_label]
+        .filter(Boolean).join(" ").toLowerCase();
+      return hay.includes(term);
+    });
+    rows.sort((a, b) => {
+      const av = a[sortKey] ?? "", bv = b[sortKey] ?? "";
+      if (av < bv) return -1 * sortDir;
+      if (av > bv) return 1 * sortDir;
+      return 0;
+    });
+    tbody.innerHTML = "";
+    for (const e of rows) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${e.date || ""}</td>
+        <td><span class="badge ${e.type}">${e.type}</span></td>
+        <td>${e.number || ""}</td>
+        <td>${e.receiver || ""}</td>
+        <td>${e.status_label || e.status || ""}</td>
+        <td class="num">${fmtMoney(e.gross, e.currency)}</td>
+        <td>${e.no_pdf ? '<span class="muted">kein PDF</span>' : `<a href="${e.pdf}" target="_blank">PDF</a>`}</td>
+        <td><a href="${e.json}" target="_blank">JSON</a></td>`;
+      tbody.appendChild(tr);
+    }
+    empty.hidden = rows.length > 0;
+    meta.textContent = `${rows.length} / ${entries.length} Einträge`;
+  }
+
+  document.querySelectorAll("th[data-k]").forEach((th) => {
+    th.addEventListener("click", () => {
+      const k = th.dataset.k;
+      if (sortKey === k) sortDir = -sortDir;
+      else { sortKey = k; sortDir = 1; }
+      render();
+    });
+  });
+  q.addEventListener("input", render);
+  typeSel.addEventListener("change", render);
+  yearSel.addEventListener("change", render);
+
+  fetch("manifest.json")
+    .then((r) => r.json())
+    .then((m) => {
+      entries = m.entries || [];
+      const years = Array.from(new Set(entries.map((e) => e.year).filter(Boolean))).sort().reverse();
+      for (const y of years) {
+        const o = document.createElement("option");
+        o.value = y; o.textContent = y;
+        yearSel.appendChild(o);
+      }
+      render();
+    })
+    .catch((err) => {
+      meta.textContent = "Fehler beim Laden von manifest.json — starte via python3 serve.py";
+      console.error(err);
+    });
+})();
+</script>
+</body>
+</html>
