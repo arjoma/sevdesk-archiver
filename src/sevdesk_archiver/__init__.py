@@ -1,5 +1,7 @@
 """SevDesk Archiver — build a local, self-serving archive of SevDesk documents."""
 
+from importlib.metadata import PackageNotFoundError, version
+
 from . import archive
 from .archive import verify_archive
 from .exceptions import (
@@ -10,7 +12,10 @@ from .exceptions import (
 )
 from .sevdesk import SevDeskClient
 
-__version__ = "0.1.0"
+try:
+    __version__ = version("sevdesk-archiver")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     "SevDeskClient",
