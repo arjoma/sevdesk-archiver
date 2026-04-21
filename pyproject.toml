@@ -1,6 +1,6 @@
 [project]
 name = "sevdesk-archiver"
-version = "0.1.0"
+version = "0.1.1"
 description = "Standalone tool to build a local, self-serving archive of SevDesk documents (invoices, credit notes, vouchers)."
 readme = "README.md"
 requires-python = ">=3.11"

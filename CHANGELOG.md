@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-21
+
 ### Added
 - `archive --api-token` CLI flag as an alternative to `SEVDESK_API_TOKEN` / `.env`.
 
@@ -35,5 +37,6 @@ First public release.
 - GitHub Actions CI (pytest, ruff, mypy on Python 3.13 via uv).
 - GitHub Actions release workflow: PyPI publish via trusted publishing on `v*.*.*` tags, with tag-vs-pyproject version verification and automatic GitHub Release creation.
 
-[Unreleased]: https://github.com/arjoma/sevdesk-archiver/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/arjoma/sevdesk-archiver/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/arjoma/sevdesk-archiver/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/arjoma/sevdesk-archiver/releases/tag/v0.1.0
