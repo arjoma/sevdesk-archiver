@@ -9,7 +9,8 @@ Idempotent and self-correcting. Each archive run:
 
 Filename scheme: ``<prefix>-<yyyymmdd>-<number>-<receiver>.pdf`` (and matching .json).
 The filename is frozen once written: if SevDesk metadata later changes (receiver renamed,
-number edited), the JSON is refreshed but the filename is not renamed.
+number edited), the JSON is refreshed but the filename is not renamed. If two different
+documents generate the same filename, the later one gets ``-<sevdesk_id>`` appended.
 """
 
 import hashlib
@@ -169,6 +170,22 @@ def _hash_file(path: str) -> str:
     return f"{HASH_PREFIX}{h.hexdigest()}"
 
 
+def _atomic_write_bytes(path: str, data: bytes) -> None:
+    """Write via a sibling .tmp file + os.replace so a crash mid-write can
+    never leave a truncated file at the final path."""
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+    os.replace(tmp, path)
+
+
 _SIDECAR_REQUIRED_KEYS = (
     "archive_version",
     "sevdesk_id",
@@ -277,8 +294,7 @@ def _write_sidecar(
     if pdf_hash is not None:
         payload["pdf_hash"] = pdf_hash
     payload["document"] = doc
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+    _atomic_write_json(json_path, payload)
     return payload
 
 
@@ -447,8 +463,7 @@ def write_manifest(
         "count": len(entries),
         "entries": entries,
     }
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+    _atomic_write_json(manifest_path, payload)
     return manifest_path
 
 
@@ -673,8 +688,7 @@ def backfill_sidecar_hashes(target_dir: str) -> Dict[str, int]:
         if "pdf_hash" not in new_meta:
             new_meta["pdf_hash"] = pdf_hash
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(new_meta, f, ensure_ascii=False, indent=2, default=str)
+            _atomic_write_json(path, new_meta)
             result["updated"] += 1
         except OSError:
             result["errors"] += 1
@@ -777,6 +791,17 @@ def archive(
         "message": f"Indexed {len(index)} existing sidecar(s).",
     }
 
+    # PDF basenames already owned by an indexed document. Used to detect two
+    # different documents generating the same filename (e.g. two vouchers with
+    # identical date/description/supplier and no voucher number).
+    claimed_filenames: set = set()
+    for entry in index.values():
+        claimed_filenames.add(
+            os.path.basename(entry["pdf"])
+            if entry.get("pdf")
+            else os.path.basename(entry["json"])[:-5] + ".pdf"
+        )
+
     doc_types = ["Invoice"]
     if include_credit_notes:
         doc_types.append("CreditNote")
@@ -847,22 +872,32 @@ def archive(
                 seen_ids.add(sev_id)
 
                 existing = index.get(sev_id)
-                pdf_filename = (
-                    os.path.basename(existing["pdf"])
-                    if existing and existing.get("pdf")
-                    else None
-                ) or (
-                    os.path.basename(existing["json"]).replace(".json", ".pdf")
-                    if existing
-                    else generate_archive_filename(doc, doc_type)
-                )
+                if existing is not None:
+                    pdf_filename = (
+                        os.path.basename(existing["pdf"])
+                        if existing.get("pdf")
+                        else os.path.basename(existing["json"])[:-5] + ".pdf"
+                    )
+                else:
+                    pdf_filename = generate_archive_filename(doc, doc_type)
+                    if pdf_filename in claimed_filenames:
+                        # Same generated name as a *different* document —
+                        # disambiguate with the SevDesk id instead of
+                        # silently sharing (and thus losing) files.
+                        pdf_filename = f"{pdf_filename[:-4]}-{sev_id}.pdf"
+                claimed_filenames.add(pdf_filename)
                 pdf_path = os.path.join(files_dir, pdf_filename)
                 json_path = _sidecar_path(pdf_path)
 
-                need_pdf = not os.path.exists(pdf_path)
-                need_json = not os.path.exists(json_path) or (
-                    existing is not None
-                    and not _sidecar_equivalent(existing.get("meta", {}), doc)
+                need_pdf = (
+                    not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0
+                )
+                # existing is None with json_path present means the sidecar on
+                # disk was malformed (scan skipped it) — rewrite it.
+                need_json = (
+                    existing is None
+                    or not os.path.exists(json_path)
+                    or not _sidecar_equivalent(existing.get("meta", {}), doc)
                 )
 
                 if not need_pdf and not need_json:
@@ -896,9 +931,12 @@ def archive(
                             ),
                             label=f"download {sev_id}",
                         )
-                        with open(pdf_path, "wb") as f:
-                            f.write(content)
+                        _atomic_write_bytes(pdf_path, content)
                         pdf_hash = _hash_bytes(content)
+                        # The PDF bytes (and thus the hash) may differ from a
+                        # previous download — always refresh the sidecar so
+                        # its pdf_hash matches what is on disk.
+                        need_json = True
                         totals["downloaded"] += 1
                         yield {
                             "type": "success",
