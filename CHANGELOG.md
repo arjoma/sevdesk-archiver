@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- README section on running headless (cron / systemd): periodic full-history sweep to catch backdated or late-booked documents, `flock` against overlapping runs, version pinning, and keeping the API token outside the archive directory.
+- Filename collision handling: when two different documents generate the same archive filename (e.g. two vouchers with identical date, description, and supplier), the later one gets `-<sevdesk_id>` appended instead of being silently skipped and never downloaded.
+- Zero-byte PDFs on disk are treated as missing and re-downloaded.
+- Malformed JSON sidecars (e.g. from a crash mid-write) are rewritten on the next `archive` run instead of being left broken forever.
+- Test suite for `SevDeskClient`: pagination, date-window widening and client-side filtering, all `getPdf` response formats, 404 → `DocumentNotFoundError`, and 429 / retry-exhaustion → `RateLimitExceededError` mapping.
+
+### Fixed
+- Re-downloading a missing PDF now always refreshes the sidecar, so `pdf_hash` matches the bytes on disk even when SevDesk returns a byte-different render. Previously the sidecar kept the old hash and `verify` reported a spurious mismatch.
+- All archive writes (PDFs, sidecars, `manifest.json`, hash backfill) now go through a temp file + atomic rename, so an interrupted run can never leave a truncated file at the final path — which previously could get its truncated hash recorded as ground truth on the next run.
+
 ## [0.1.1] - 2026-04-21
 
 ### Added

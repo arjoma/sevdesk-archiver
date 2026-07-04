@@ -71,11 +71,27 @@ Drop a `.env` (with `ARCHIVE_TARGET=.` and your token) into an archive directory
 cd /path/to/archive && uvx sevdesk-archiver@latest archive
 ```
 
-Or as a cron / systemd-timer job:
+### Running headless (cron / systemd timer)
 
-```bash
-cd /path/to/archive && uvx sevdesk-archiver@latest archive && uvx sevdesk-archiver@latest verify
+The `archive` command is idempotent and exits non-zero on any error, so it is safe and monitorable as a scheduled job. Three things matter for unattended operation:
+
+1. **Add a periodic full-history sweep.** The default date range (1st of previous month … today) filters by *document date*, not booking date. A voucher entered today but dated three months ago — or an invoice finalized long after its invoice date — falls outside the rolling window and would never be archived. A regular sweep over your full history closes that gap; since runs are idempotent, it only costs metadata fetches.
+2. **Prevent overlapping runs.** Rate-limit backoff can stretch a run past the next scheduled start; use `flock` (or a systemd timer, which never overlaps) so two runs don't write concurrently.
+3. **Pin the version.** `@latest` in a cron job means unattended auto-upgrades; pin and bump deliberately.
+
+```cron
+# hourly incremental refresh (default window: 1st of previous month … today)
+15 * * * *  cd /path/to/archive && flock -n /tmp/sevdesk-archiver.lock \
+  uvx sevdesk-archiver@0.1.1 archive
+
+# weekly full sweep (catches backdated / late-booked documents) + integrity check
+30 3 * * 0  cd /path/to/archive && flock /tmp/sevdesk-archiver.lock sh -c \
+  'uvx sevdesk-archiver@0.1.1 archive --after 2020-01-01 && uvx sevdesk-archiver@0.1.1 verify'
 ```
+
+Cron mails you the output on non-zero exit (or point the job at a dead-man's-switch service like healthchecks.io).
+
+**Token hygiene:** for headless use, keep `SEVDESK_API_TOKEN` *outside* the archive directory (crontab environment, or systemd `EnvironmentFile=`). A `.env` inside the archive is convenient interactively, but the archive folder is designed to be copied around (USB stick, S3, …) — and the token would travel with every copy.
 
 ## Commands
 

@@ -576,6 +576,186 @@ class TestArchiveFlow(unittest.TestCase):
         self.assertTrue(any(f.startswith("vou-") and "Valid" in f for f in files))
         self.assertFalse(any("Draft" in f for f in files))
 
+    def test_redownload_refreshes_sidecar_hash(self):
+        """When a missing PDF is re-downloaded and the bytes differ from the
+        original download, the sidecar's pdf_hash must be updated to match."""
+        import hashlib
+
+        client = self._mk_client([self._doc()])
+        list(
+            archive_mod.archive(
+                client=client,
+                target_dir=self.tmp,
+                after_date="2026-02-01",
+                end_date="2026-02-28",
+            )
+        )
+        os.remove(os.path.join(self.files, "inv-20260210-RE-2026-001-ACME.pdf"))
+
+        new_bytes = b"%PDF-REGENERATED-DIFFERENT-BYTES"
+        client = self._mk_client([self._doc()])
+        client.download_document.return_value = (new_bytes, "src.pdf")
+        list(
+            archive_mod.archive(
+                client=client,
+                target_dir=self.tmp,
+                after_date="2026-02-01",
+                end_date="2026-02-28",
+            )
+        )
+
+        with open(
+            os.path.join(self.files, "inv-20260210-RE-2026-001-ACME.json"),
+            encoding="utf-8",
+        ) as f:
+            meta = json.load(f)
+        expected = f"sha256:{hashlib.sha256(new_bytes).hexdigest()}"
+        self.assertEqual(meta["pdf_hash"], expected)
+
+    def test_filename_collision_same_run_gets_id_suffix(self):
+        """Two different documents that generate the same filename must both
+        be archived — the second gets the sevdesk_id appended."""
+        docs = [
+            self._doc(_id="10", number="RE-1", date="2026-02-10", name="ACME"),
+            self._doc(_id="11", number="RE-1", date="2026-02-10", name="ACME"),
+        ]
+        client = self._mk_client(docs)
+
+        list(
+            archive_mod.archive(
+                client=client,
+                target_dir=self.tmp,
+                after_date="2026-02-01",
+                end_date="2026-02-28",
+            )
+        )
+
+        files = set(os.listdir(self.files))
+        self.assertIn("inv-20260210-RE-1-ACME.pdf", files)
+        self.assertIn("inv-20260210-RE-1-ACME-11.pdf", files)
+        self.assertEqual(client.download_document.call_count, 2)
+
+        with open(
+            os.path.join(self.files, "inv-20260210-RE-1-ACME-11.json"),
+            encoding="utf-8",
+        ) as f:
+            meta = json.load(f)
+        self.assertEqual(meta["sevdesk_id"], "11")
+
+    def test_filename_collision_across_runs_gets_id_suffix(self):
+        """A new document colliding with an already-archived one must not be
+        silently skipped."""
+        client = self._mk_client(
+            [self._doc(_id="10", number="RE-1", date="2026-02-10", name="ACME")]
+        )
+        list(
+            archive_mod.archive(
+                client=client,
+                target_dir=self.tmp,
+                after_date="2026-02-01",
+                end_date="2026-02-28",
+            )
+        )
+
+        client = self._mk_client(
+            [
+                self._doc(_id="10", number="RE-1", date="2026-02-10", name="ACME"),
+                self._doc(_id="11", number="RE-1", date="2026-02-10", name="ACME"),
+            ]
+        )
+        list(
+            archive_mod.archive(
+                client=client,
+                target_dir=self.tmp,
+                after_date="2026-02-01",
+                end_date="2026-02-28",
+            )
+        )
+
+        files = set(os.listdir(self.files))
+        self.assertIn("inv-20260210-RE-1-ACME-11.pdf", files)
+        self.assertIn("inv-20260210-RE-1-ACME-11.json", files)
+        # the original document keeps its files untouched
+        self.assertIn("inv-20260210-RE-1-ACME.pdf", files)
+
+    def test_malformed_sidecar_is_rewritten(self):
+        """A sidecar corrupted on disk (e.g. crash mid-write before atomic
+        writes existed) is rewritten on the next run."""
+        client = self._mk_client([self._doc()])
+        list(
+            archive_mod.archive(
+                client=client,
+                target_dir=self.tmp,
+                after_date="2026-02-01",
+                end_date="2026-02-28",
+            )
+        )
+        sidecar = os.path.join(self.files, "inv-20260210-RE-2026-001-ACME.json")
+        with open(sidecar, "w", encoding="utf-8") as f:
+            f.write("{truncated garbage")
+
+        client = self._mk_client([self._doc()])
+        client.download_document.reset_mock()
+        list(
+            archive_mod.archive(
+                client=client,
+                target_dir=self.tmp,
+                after_date="2026-02-01",
+                end_date="2026-02-28",
+            )
+        )
+
+        client.download_document.assert_not_called()
+        with open(sidecar, encoding="utf-8") as f:
+            meta = json.load(f)
+        self.assertEqual(meta["sevdesk_id"], "1")
+
+    def test_zero_byte_pdf_is_redownloaded(self):
+        client = self._mk_client([self._doc()])
+        list(
+            archive_mod.archive(
+                client=client,
+                target_dir=self.tmp,
+                after_date="2026-02-01",
+                end_date="2026-02-28",
+            )
+        )
+        pdf = os.path.join(self.files, "inv-20260210-RE-2026-001-ACME.pdf")
+        with open(pdf, "wb"):
+            pass  # truncate to 0 bytes
+
+        client = self._mk_client([self._doc()])
+        client.download_document.reset_mock()
+        list(
+            archive_mod.archive(
+                client=client,
+                target_dir=self.tmp,
+                after_date="2026-02-01",
+                end_date="2026-02-28",
+            )
+        )
+
+        client.download_document.assert_called_once()
+        self.assertGreater(os.path.getsize(pdf), 0)
+
+    def test_no_tmp_files_left_behind(self):
+        client = self._mk_client([self._doc()])
+        list(
+            archive_mod.archive(
+                client=client,
+                target_dir=self.tmp,
+                after_date="2026-02-01",
+                end_date="2026-02-28",
+            )
+        )
+        leftovers = [
+            n
+            for root in (self.tmp, self.files)
+            for n in os.listdir(root)
+            if n.endswith(".tmp")
+        ]
+        self.assertEqual(leftovers, [])
+
     def test_orphan_out_of_range_is_included_in_manifest(self):
         client = self._mk_client([self._doc(date="2026-02-10")])
         list(
