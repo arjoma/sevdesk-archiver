@@ -1,13 +1,26 @@
+import base64
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, NoReturn, Optional, Tuple
 
-from requests.exceptions import HTTPError, RequestException, RetryError
+from requests.exceptions import (
+    ConnectionError as RequestsConnectionError,
+    HTTPError,
+    RequestException,
+    RetryError,
+    Timeout,
+)
 
-from .exceptions import DocumentNotFoundError, RateLimitExceededError
+from .exceptions import (
+    AuthenticationError,
+    DocumentNotFoundError,
+    RateLimitExceededError,
+    SevDeskAPIError,
+)
 from .utils import create_retry_session, parse_retry_after, sanitize_filename
 
 REQUEST_TIMEOUT = 30
+_DOC_TYPES = ("Invoice", "CreditNote", "Voucher")
 logger = logging.getLogger(__name__)
 
 
@@ -25,18 +38,23 @@ class SevDeskClient:
         self.session.headers.update(self.headers)
 
     def _handle_request_exception(self, e: RequestException, context: str) -> NoReturn:
+        # Connection problems are re-raised untouched so callers (archive's
+        # _with_retry) can apply their own backoff.
+        if isinstance(e, (RequestsConnectionError, Timeout)):
+            raise e
         if isinstance(e, RetryError):
             raise RateLimitExceededError(service="SevDesk") from e
-        if (
-            isinstance(e, HTTPError)
-            and e.response is not None
-            and e.response.status_code == 429
-        ):
-            wait_time = parse_retry_after(e.response)
-            raise RateLimitExceededError(
-                service="SevDesk", retry_after=wait_time
-            ) from e
-        raise Exception(f"{context} failed after retries: {e}") from e
+        if isinstance(e, HTTPError) and e.response is not None:
+            status = e.response.status_code
+            if status == 429:
+                raise RateLimitExceededError(
+                    service="SevDesk", retry_after=parse_retry_after(e.response)
+                ) from e
+            if status in (401, 403):
+                raise AuthenticationError(
+                    f"[SevDesk] {context}: HTTP {status} — check SEVDESK_API_TOKEN"
+                ) from e
+        raise SevDeskAPIError(f"{context} failed after retries: {e}") from e
 
     def _fetch_objects(
         self,
@@ -175,11 +193,7 @@ class SevDeskClient:
         self, object_id: str, object_type: str = "Invoice"
     ) -> Tuple[bytes, str]:
         """Download the PDF/image for a given object. Returns (bytes, filename)."""
-        endpoint_type = "Invoice"
-        if object_type == "CreditNote":
-            endpoint_type = "CreditNote"
-        elif object_type == "Voucher":
-            endpoint_type = "Voucher"
+        endpoint_type = object_type if object_type in _DOC_TYPES else "Invoice"
 
         try:
             response = self.session.get(
@@ -188,7 +202,8 @@ class SevDeskClient:
             )
             response.raise_for_status()
 
-            if response.headers.get("Content-Type") == "application/pdf":
+            content_type = response.headers.get("Content-Type") or ""
+            if content_type.startswith("application/pdf"):
                 filename = sanitize_filename(f"{endpoint_type.lower()}_{object_id}.pdf")
                 return response.content, filename
 
@@ -201,16 +216,12 @@ class SevDeskClient:
             self._handle_request_exception(e, "SevDesk download_document")
 
         if "content" in data and "filename" in data:
-            import base64
-
             file_bytes = base64.b64decode(data["content"])
             return file_bytes, sanitize_filename(data["filename"])
 
         if "objects" in data and isinstance(data["objects"], dict):
             obj = data["objects"]
             if "content" in obj and "filename" in obj:
-                import base64
-
                 if obj.get("base64Encoded", False):
                     file_bytes = base64.b64decode(obj["content"])
                 else:
@@ -221,7 +232,7 @@ class SevDeskClient:
                     )
                 return file_bytes, sanitize_filename(obj["filename"])
 
-        raise ValueError(f"Unexpected response format from getPdf: {data.keys()}")
+        raise ValueError(f"Unexpected response format from getPdf: {list(data.keys())}")
 
     def download_pdf(
         self, object_id: str, object_type: str = "Invoice"

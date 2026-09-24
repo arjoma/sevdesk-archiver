@@ -39,6 +39,10 @@ def create_retry_session(
         backoff_factor=backoff_factor,
         status_forcelist=status_forcelist,
         allowed_methods=allowed_methods,
+        # Return the final response instead of raising RetryError, so callers
+        # see the real status code (429 with Retry-After vs. a persistent 5xx)
+        # rather than every exhausted retry looking like a rate limit.
+        raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("http://", adapter)
@@ -140,28 +144,3 @@ def format_date(date_val: Any) -> str:
         return s_val[:10]
     return s_val
 
-
-def update_env_var(key: str, value: str, path: str = ".env") -> None:
-    """Update a single key in a .env file, adding it if absent. 0o600 perms."""
-    try:
-        with open(path, "r") as f:
-            lines = f.readlines()
-    except FileNotFoundError:
-        lines = []
-    updated = False
-    new_lines = []
-    for line in lines:
-        if line.startswith(f"{key}="):
-            new_lines.append(f"{key}={value}\n")
-            updated = True
-        else:
-            new_lines.append(line)
-    if not updated:
-        new_lines.append(f"{key}={value}\n")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.writelines(new_lines)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass

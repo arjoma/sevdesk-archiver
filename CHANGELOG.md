@@ -13,10 +13,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-byte PDFs on disk are treated as missing and re-downloaded.
 - Malformed JSON sidecars (e.g. from a crash mid-write) are rewritten on the next `archive` run instead of being left broken forever.
 - Test suite for `SevDeskClient`: pagination, date-window widening and client-side filtering, all `getPdf` response formats, 404 → `DocumentNotFoundError`, and 429 / retry-exhaustion → `RateLimitExceededError` mapping.
+- `SevDeskAPIError` (subclass of `SevDeskArchiverError`) for non-retryable API failures; previously a bare `Exception` was raised. `AuthenticationError` now subclasses it.
+- HTTP 401/403 raise `AuthenticationError`, and `archive` aborts the run on the first one instead of logging a failure for every month and document.
+- `archive` deletes leftover `*.tmp` files from a previously killed run.
+- `verify` reports `unindexed_sidecars`: valid sidecars missing from `manifest.json` (e.g. a run killed before the manifest was written). `archive_mod.count_issues()` and `deletable_orphans()` helpers.
+- `verify --format json` output includes `issue_count`.
+
+### Changed
+- `verify --format json` now exits non-zero when issues are found, like the text format. Previously it always exited 0, so scripted checks never saw a failure.
+- `verify --delete-orphans` no longer deletes valid sidecars (and their PDFs) that are only missing from a stale manifest; it points you to re-run `archive` instead.
+- Connection errors and timeouts from `SevDeskClient` now propagate as the original `requests` exceptions, so `archive`'s network backoff (previously unreachable) actually retries them.
+
+### Removed
+- Unused `utils.update_env_var`.
 
 ### Fixed
 - Re-downloading a missing PDF now always refreshes the sidecar, so `pdf_hash` matches the bytes on disk even when SevDesk returns a byte-different render. Previously the sidecar kept the old hash and `verify` reported a spurious mismatch.
-- All archive writes (PDFs, sidecars, `manifest.json`, hash backfill) now go through a temp file + atomic rename, so an interrupted run can never leave a truncated file at the final path — which previously could get its truncated hash recorded as ground truth on the next run.
+- All archive writes (PDFs, sidecars, `manifest.json`, hash backfill) now go through a temp file + fsync + atomic rename, so an interrupted run or power loss can never leave a truncated file at the final path — which previously could get its truncated hash recorded as ground truth on the next run. A failed write removes its temp file.
+- `archive --dry-run` no longer touches the filesystem: it previously created the target directories and moved legacy flat-layout files into `files/`.
+- Documents without a PDF (`_no_pdf`) no longer get their sidecar rewritten (with a new `archived_at`) on every run, and a transient download error no longer drops the `_no_pdf` marker.
+- Exhausted HTTP retries now surface the real status: a persistent 5xx is no longer misreported as a rate limit, and a final 429 keeps its `Retry-After`.
+- PDF downloads with a `Content-Type` carrying parameters (e.g. `application/pdf; charset=binary`) are recognised as PDFs.
 
 ## [0.1.1] - 2026-04-21
 

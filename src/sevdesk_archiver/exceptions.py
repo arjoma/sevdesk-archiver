@@ -22,10 +22,17 @@ class RateLimitExceededError(SevDeskArchiverError):
         )
 
 
-class AuthenticationError(SevDeskArchiverError):
-    """Raised when authentication fails."""
+class SevDeskAPIError(SevDeskArchiverError):
+    """Raised when a SevDesk request fails for a non-retryable reason
+    (5xx after retries, unexpected response shape, other HTTP errors)."""
 
-    pass
+
+class AuthenticationError(SevDeskAPIError):
+    """Raised on HTTP 401/403 — the API token is missing, wrong, or revoked.
+
+    Not retryable; ``archive()`` aborts the run instead of failing every
+    month and document individually.
+    """
 
 
 class DocumentNotFoundError(SevDeskArchiverError):
