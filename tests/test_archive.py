@@ -782,6 +782,27 @@ class TestArchiveFlow(unittest.TestCase):
         self.assertEqual(manifest["count"], 1)
         self.assertEqual(manifest["entries"][0]["id"], "1")
 
+    def test_orphan_sidecar_pdf_filename_cannot_escape_files_dir(self):
+        os.makedirs(self.files)
+        with open(os.path.join(self.files, "inv-x.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "archive_version": 1,
+                    "sevdesk_id": "77",
+                    "type": "Invoice",
+                    "pdf_filename": "../../secret.pdf",
+                    "document": {"id": "77", "invoiceDate": "2020-01-01"},
+                },
+                f,
+            )
+
+        self._run(self._mk_client([]))
+
+        with open(os.path.join(self.tmp, "manifest.json"), encoding="utf-8") as f:
+            entry = json.load(f)["entries"][0]
+        self.assertEqual(entry["pdf"], "files/secret.pdf")
+        self.assertNotIn("..", entry["json"])
+
     def _run(self, client, **kw):
         kw.setdefault("after_date", "2026-02-01")
         kw.setdefault("end_date", "2026-02-28")
@@ -914,6 +935,94 @@ class TestArchiveFlow(unittest.TestCase):
 
         self.assertFalse(os.path.exists(stale))
         self.assertTrue(any("leftover temp" in e["message"] for e in events))
+
+
+class TestSameIdAcrossTypes(unittest.TestCase):
+    """SevDesk ids are only unique per object type."""
+
+    def setUp(self):
+        import shutil
+
+        self.tmp = os.path.join(os.path.dirname(__file__), "_tmp_same_id")
+        if os.path.exists(self.tmp):
+            shutil.rmtree(self.tmp)
+        self.files = os.path.join(self.tmp, "files")
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmp)
+
+    def _client(self):
+        client = MagicMock()
+        client.get_invoices.return_value = [
+            {"id": "5", "invoiceNumber": "RE-5", "invoiceDate": "2026-02-10", "status": "200"}
+        ]
+        client.get_credit_notes.return_value = []
+        client.get_vouchers.return_value = [
+            {"id": "5", "voucherDate": "2026-02-11", "description": "B-5", "status": "1000"}
+        ]
+        client.download_document.return_value = (b"%PDF", "x.pdf")
+        return client
+
+    def _run(self, client):
+        return list(
+            archive_mod.archive(
+                client=client,
+                target_dir=self.tmp,
+                after_date="2026-02-01",
+                end_date="2026-02-28",
+                include_vouchers=True,
+            )
+        )
+
+    def test_invoice_and_voucher_with_same_id_are_both_archived(self):
+        client = self._client()
+        self._run(client)
+
+        self.assertEqual(client.download_document.call_count, 2)
+        self.assertEqual(len([n for n in os.listdir(self.files) if n.endswith(".json")]), 2)
+
+        events = self._run(client)
+        self.assertIn("Skipped=2", events[-1]["message"])
+        self.assertEqual(client.download_document.call_count, 2)
+
+        with open(os.path.join(self.tmp, "manifest.json"), encoding="utf-8") as f:
+            types = sorted(e["type"] for e in json.load(f)["entries"])
+        self.assertEqual(types, ["Invoice", "Voucher"])
+
+        report = archive_mod.verify_archive(self.tmp)
+        self.assertEqual(report["duplicate_sevdesk_ids"], [])
+        self.assertEqual(archive_mod.count_issues(report), 0)
+
+        keys = sorted(archive_mod.scan_archive(self.tmp))
+        self.assertEqual(keys, [("Invoice", "5"), ("Voucher", "5")])
+        self.assertEqual(list(scan_existing(self.tmp)), ["5"])
+
+    def test_archive_files_are_owner_only(self):
+        import stat
+
+        self._run(self._client())
+
+        paths = [os.path.join(self.files, n) for n in os.listdir(self.files)]
+        paths.append(os.path.join(self.tmp, "manifest.json"))
+        for p in paths:
+            self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600, p)
+        self.assertEqual(stat.S_IMODE(os.stat(self.files).st_mode) & 0o077, 0)
+
+
+class TestPublicDocumentHelpers(unittest.TestCase):
+    def test_helpers(self):
+        doc = {
+            "id": "9",
+            "creditNoteDate": "2026-03-02T00:00:00+01:00",
+            "contact": {"surename": "Ada", "familyname": "Lovelace"},
+        }
+        self.assertEqual(archive_mod.document_date_field("CreditNote"), "creditNoteDate")
+        self.assertEqual(archive_mod.document_date(doc, "CreditNote"), "2026-03-02")
+        self.assertEqual(archive_mod.document_number(doc, "CreditNote"), "CN-9")
+        self.assertEqual(archive_mod.document_receiver(doc, "CreditNote"), "Ada Lovelace")
+        self.assertIs(archive_mod._number_for, archive_mod.document_number)
 
 
 class TestAtomicWrite(unittest.TestCase):

@@ -84,7 +84,7 @@ _UNSAFE_FILENAME_CHARS = re.compile(r'[:*?"<>|]')
 _WHITESPACE = re.compile(r"\s+")
 
 
-_DATE_FIELD = {
+DATE_FIELDS = {
     "Invoice": "invoiceDate",
     "CreditNote": "creditNoteDate",
     "Voucher": "voucherDate",
@@ -96,11 +96,18 @@ _FETCH_METHOD = {
 }
 
 
-def _date_field_for(doc_type: str) -> str:
-    return _DATE_FIELD[doc_type]
+def document_date_field(doc_type: str) -> str:
+    """SevDesk field holding the document date (e.g. ``invoiceDate``)."""
+    return DATE_FIELDS[doc_type]
 
 
-def _number_for(doc: Dict[str, Any], doc_type: str) -> str:
+def document_date(doc: Dict[str, Any], doc_type: str) -> str:
+    """Document date as ``YYYY-MM-DD`` (empty string if unknown)."""
+    return format_date(doc.get(document_date_field(doc_type)))
+
+
+def document_number(doc: Dict[str, Any], doc_type: str) -> str:
+    """Human-facing document number, falling back to a type-prefixed id."""
     if doc_type == "Invoice":
         return str(doc.get("invoiceNumber") or f"INV-{doc.get('id', '')}")
     if doc_type == "CreditNote":
@@ -114,7 +121,7 @@ def _number_for(doc: Dict[str, Any], doc_type: str) -> str:
     return str(doc.get("id", ""))
 
 
-def _receiver_for(doc: Dict[str, Any], doc_type: str) -> str:
+def document_receiver(doc: Dict[str, Any], doc_type: str) -> str:
     """Best human-readable name for the counter-party.
 
     SevDesk Contact objects have ``name`` for companies; individuals leave that
@@ -131,6 +138,12 @@ def _receiver_for(doc: Dict[str, Any], doc_type: str) -> str:
     sur = str(party.get("surename") or "").strip()
     fam = str(party.get("familyname") or "").strip()
     return f"{sur} {fam}".strip()
+
+
+# Backwards-compatible private aliases.
+_date_field_for = document_date_field
+_number_for = document_number
+_receiver_for = document_receiver
 
 
 def _clean_for_filename(value: str, max_len: int = _RECEIVER_MAX_LEN) -> str:
@@ -150,10 +163,10 @@ def _clean_for_filename(value: str, max_len: int = _RECEIVER_MAX_LEN) -> str:
 def generate_archive_filename(doc: Dict[str, Any], doc_type: str) -> str:
     """Build ``<prefix>-<yyyymmdd>-<number>-<receiver>.pdf``."""
     prefix = TYPE_PREFIX.get(doc_type, "doc")
-    date_iso = format_date(doc.get(_date_field_for(doc_type)))
+    date_iso = document_date(doc, doc_type)
     date_compact = date_iso.replace("-", "") if date_iso else "00000000"
-    number = _clean_for_filename(_number_for(doc, doc_type), max_len=60)
-    receiver = _clean_for_filename(_receiver_for(doc, doc_type))
+    number = _clean_for_filename(document_number(doc, doc_type), max_len=60)
+    receiver = _clean_for_filename(document_receiver(doc, doc_type))
     parts = [prefix, date_compact, number]
     if receiver:
         parts.append(receiver)
@@ -191,12 +204,19 @@ def _hash_file(path: str) -> str:
 TMP_SUFFIX = ".tmp"
 
 
+# Archive contents are financial records with personal data: owner-only.
+FILE_MODE = 0o600
+DIR_MODE = 0o700
+
+
 def _atomic_write_bytes(path: str, data: bytes) -> None:
     """Write via a sibling .tmp file + fsync + os.replace so a crash or power
-    loss mid-write can never leave a truncated file at the final path."""
+    loss mid-write can never leave a truncated file at the final path.
+    The file is created with mode ``FILE_MODE`` (owner-only)."""
     tmp = path + TMP_SUFFIX
     try:
-        with open(tmp, "wb") as f:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
+        with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
@@ -268,7 +288,7 @@ def migrate_flat_to_subdir(target_dir: str) -> int:
     if not os.path.isdir(target_dir):
         return 0
     files_dir = _files_dir(target_dir)
-    os.makedirs(files_dir, exist_ok=True)
+    os.makedirs(files_dir, mode=DIR_MODE, exist_ok=True)
     moved = 0
     for name in os.listdir(target_dir):
         if name in (MANIFEST_FILENAME, INDEX_FILENAME, FILES_SUBDIR):
@@ -286,14 +306,18 @@ def migrate_flat_to_subdir(target_dir: str) -> int:
     return moved
 
 
-def scan_existing(target_dir: str) -> Dict[str, Dict[str, Any]]:
+DocKey = Tuple[str, str]
+
+
+def scan_archive(target_dir: str) -> Dict[DocKey, Dict[str, Any]]:
     """Walk the archive's ``files/`` subdir for *.json sidecars.
 
-    Returns id -> entry map. Each entry:
+    Returns ``(doc_type, sevdesk_id) -> entry``. SevDesk ids are only unique
+    per object type, so an Invoice and a Voucher may share an id. Each entry:
     ``{'json': path, 'pdf': path|None, 'doc_type': str, 'meta': dict}``.
     Unreadable or malformed sidecars are logged and skipped.
     """
-    index: Dict[str, Dict[str, Any]] = {}
+    index: Dict[DocKey, Dict[str, Any]] = {}
     files_dir = _files_dir(target_dir)
     if not os.path.isdir(files_dir):
         return index
@@ -311,13 +335,23 @@ def scan_existing(target_dir: str) -> Dict[str, Dict[str, Any]]:
         if not sev_id:
             continue
         pdf_path = json_path[:-5] + ".pdf"
-        index[str(sev_id)] = {
+        doc_type = meta.get("type", "Invoice")
+        index[(doc_type, str(sev_id))] = {
             "json": json_path,
             "pdf": pdf_path if os.path.exists(pdf_path) else None,
-            "doc_type": meta.get("type", "Invoice"),
+            "doc_type": doc_type,
             "meta": meta,
         }
     return index
+
+
+def scan_existing(target_dir: str) -> Dict[str, Dict[str, Any]]:
+    """Like :func:`scan_archive` but keyed by sevdesk id alone.
+
+    Kept for backwards compatibility; if two document types share an id only
+    one of them is returned. Prefer ``scan_archive``.
+    """
+    return {sid: entry for (_t, sid), entry in scan_archive(target_dir).items()}
 
 
 def _write_sidecar(
@@ -451,7 +485,7 @@ def _status_label(doc: Dict[str, Any], doc_type: str) -> str:
 def _manifest_entry(
     doc: Dict[str, Any], doc_type: str, pdf_filename: str
 ) -> Dict[str, Any]:
-    date_iso = format_date(doc.get(_date_field_for(doc_type)))
+    date_iso = document_date(doc, doc_type)
     year, month = None, None
     if date_iso and len(date_iso) >= 7:
         try:
@@ -469,8 +503,8 @@ def _manifest_entry(
         "date": date_iso,
         "year": year,
         "month": month,
-        "number": _number_for(doc, doc_type),
-        "receiver": _receiver_for(doc, doc_type),
+        "number": document_number(doc, doc_type),
+        "receiver": document_receiver(doc, doc_type),
         "gross": doc.get("sumGross"),
         "net": doc.get("sumNet"),
         "tax": doc.get("sumTax"),
@@ -519,7 +553,7 @@ def verify_archive(target_dir: str, check_hashes: bool = True) -> Dict[str, Any]
         (``_no_pdf``-flagged sidecars are exempt)
       * every sidecar has the required keys and its ``pdf_filename`` matches
         its own filename stem
-      * no two sidecars claim the same ``sevdesk_id``
+      * no two sidecars claim the same ``(type, sevdesk_id)``
       * manifest entries and sidecars agree on ``id``, ``type``, and
         ``pdf_filename``
       * when ``check_hashes=True``, every sidecar with a recorded
@@ -565,7 +599,7 @@ def verify_archive(target_dir: str, check_hashes: bool = True) -> Dict[str, Any]
     out["files_on_disk"] = on_disk
 
     sidecars: Dict[str, Dict[str, Any]] = {}
-    by_id: Dict[str, List[str]] = {}
+    by_key: Dict[DocKey, List[str]] = {}
     for name in sorted(on_disk):
         if not name.endswith(".json"):
             continue
@@ -581,11 +615,13 @@ def verify_archive(target_dir: str, check_hashes: bool = True) -> Dict[str, Any]
         sidecars[name] = meta
         sid = str(meta.get("sevdesk_id") or "")
         if sid:
-            by_id.setdefault(sid, []).append(name)
+            by_key.setdefault((str(meta.get("type") or ""), sid), []).append(name)
 
-    for sid, paths in sorted(by_id.items()):
+    for (doc_type, sid), paths in sorted(by_key.items()):
         if len(paths) > 1:
-            out["duplicate_sevdesk_ids"].append({"id": sid, "files": sorted(paths)})
+            out["duplicate_sevdesk_ids"].append(
+                {"id": sid, "type": doc_type, "files": sorted(paths)}
+            )
 
     for name in sorted(on_disk):
         if name.endswith(".pdf"):
@@ -746,7 +782,9 @@ def backfill_sidecar_hashes(target_dir: str) -> Dict[str, int]:
         if doc.get("_no_pdf"):
             result["skipped"] += 1
             continue
-        pdf_name = str(meta.get("pdf_filename") or (name[:-5] + ".pdf"))
+        pdf_name = os.path.basename(str(meta.get("pdf_filename") or "")) or (
+            name[:-5] + ".pdf"
+        )
         pdf_path = os.path.join(files_dir, pdf_name)
         if not os.path.exists(pdf_path):
             result["missing_pdf"] += 1
@@ -834,7 +872,7 @@ def archive(
     """
     files_dir = _files_dir(target_dir)
     if not dry_run:
-        os.makedirs(files_dir, exist_ok=True)
+        os.makedirs(files_dir, mode=DIR_MODE, exist_ok=True)
 
     effective_after = after_date or _default_after()
     effective_end = end_date or datetime.now().strftime("%Y-%m-%d")
@@ -862,7 +900,7 @@ def archive(
                 "message": f"Removed {stale} leftover temp file(s) from an interrupted run",
             }
 
-    index = scan_existing(target_dir)
+    index = scan_archive(target_dir)
     yield {
         "type": "info",
         "message": f"Indexed {len(index)} existing sidecar(s).",
@@ -888,7 +926,7 @@ def archive(
         "seen": 0,
     }
     manifest_entries: List[Dict[str, Any]] = []
-    seen_ids: set = set()
+    seen: set = set()
 
     for month_start, month_end in _iter_month_ranges(effective_after, effective_end):
         yield {
@@ -941,11 +979,12 @@ def archive(
                 sev_id = str(doc.get("id", ""))
                 if not sev_id:
                     continue
-                if sev_id in seen_ids:
+                key = (doc_type, sev_id)
+                if key in seen:
                     continue
-                seen_ids.add(sev_id)
+                seen.add(key)
 
-                existing = index.get(sev_id)
+                existing = index.get(key)
                 if existing is not None:
                     pdf_filename = _pdf_filename_for(existing)
                 else:
@@ -1062,7 +1101,7 @@ def archive(
 
                 manifest_entries.append(_manifest_entry(doc, doc_type, pdf_filename))
 
-    orphans = [sid for sid in index if sid not in seen_ids]
+    orphans = [key for key in index if key not in seen]
     if orphans:
         yield {
             "type": "info",
@@ -1071,12 +1110,14 @@ def archive(
                 "keeping and including in manifest."
             ),
         }
-        for sid in orphans:
-            entry = index[sid]
+        for key in orphans:
+            entry = index[key]
             meta = entry.get("meta", {})
             doc = meta.get("document") or {}
             doc_type = entry.get("doc_type", "Invoice")
-            pdf_filename = meta.get("pdf_filename") or _pdf_filename_for(entry)
+            pdf_filename = os.path.basename(
+                str(meta.get("pdf_filename") or "")
+            ) or _pdf_filename_for(entry)
             manifest_entries.append(_manifest_entry(doc, doc_type, pdf_filename))
 
     if not dry_run:

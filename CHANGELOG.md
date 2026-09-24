@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-24
+
+### Added
+- Public per-type helpers `document_date_field()`, `document_date()`, `document_number()`, `document_receiver()` and the `DATE_FIELDS` map in `sevdesk_archiver.archive`, so downstream tools don't need their own copies. The old private names remain as aliases.
+- `scan_archive()`, which keys existing sidecars by `(type, sevdesk_id)`. `scan_existing()` is kept for compatibility.
+- `parse_retry_after` accepts any response object with a `headers` mapping (e.g. httpx) and understands the HTTP-date form of `Retry-After`.
+
+### Fixed
+- An Invoice and a Voucher (or Credit Note) with the same SevDesk id are both archived. Ids are only unique per type; previously the second document was silently skipped. `verify` reports duplicates per `(type, id)` and includes the `type` in each `duplicate_sevdesk_ids` entry.
+- `create_retry_session` no longer retries POST requests by default, since retrying a POST after a 5xx can create duplicates. Pass `allowed_methods` to override.
+- `format_date("2024-01-0001")` no longer returns `"2024-01-00"`: a date prefix followed by more digits is not treated as a date.
+- `serve` and the bundled `serve.py`: warn that the archive is readable without authentication when bound to a non-loopback host, reuse the address after a restart, and reject an invalid port with a clear message instead of a traceback. `serve --host 0.0.0.0` prints a usable `127.0.0.1` URL.
+- A sidecar's `pdf_filename` is reduced to its basename before it is used in the manifest or for hash backfill, so it can never point outside `files/`.
+- The viewer's "no archive found" hint now suggests `./serve-archive.sh` / `python3 serve.py`, which ship inside every archive, instead of a command name that may not exist.
+
+### Security
+- Archived PDFs, sidecars and `manifest.json` are now written with mode `0600`, and a newly created `files/` directory with `0700`. They were previously created with the default umask, usually world-readable. Existing files keep their permissions until they are rewritten; run `chmod -R go-rwx <archive>` to tighten an existing archive.
+
 ## [0.2.0] - 2026-09-24
 
 ### Added
@@ -67,7 +85,8 @@ First public release.
 - GitHub Actions CI (pytest, ruff, mypy on Python 3.13 via uv).
 - GitHub Actions release workflow: PyPI publish via trusted publishing on `v*.*.*` tags, with tag-vs-pyproject version verification and automatic GitHub Release creation.
 
-[Unreleased]: https://github.com/arjoma/sevdesk-archiver/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/arjoma/sevdesk-archiver/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/arjoma/sevdesk-archiver/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/arjoma/sevdesk-archiver/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/arjoma/sevdesk-archiver/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/arjoma/sevdesk-archiver/releases/tag/v0.1.0
