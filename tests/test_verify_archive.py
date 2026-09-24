@@ -172,9 +172,53 @@ class TestVerifyArchive(unittest.TestCase):
         result = runner.invoke(
             cli, ["verify", "--target", self.tmp, "--format", "json"]
         )
-        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.exit_code, 1)
         data = json.loads(result.output)
         self.assertIn("stray.pdf", data["orphan_pdf"])
+        self.assertEqual(data["issue_count"], 2)  # orphan + unpaired
+
+    def test_cli_json_format_consistent_exits_zero(self):
+        self._write_manifest([])
+
+        result = CliRunner().invoke(
+            cli, ["verify", "--target", self.tmp, "--format", "json"]
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(json.loads(result.output)["issue_count"], 0)
+
+    def test_cli_json_format_missing_manifest_exits_nonzero(self):
+        result = CliRunner().invoke(
+            cli, ["verify", "--target", self.tmp, "--format", "json"]
+        )
+        self.assertEqual(result.exit_code, 1)
+
+    def test_valid_sidecar_missing_from_manifest_is_unindexed(self):
+        """A run killed before write_manifest leaves valid pairs that the
+        manifest doesn't list — they must be reported, not deleted."""
+        self._write_manifest([])
+        self._write_sidecar("inv-1.json", sevdesk_id="1")
+        self._touch("inv-1.pdf")
+        self._touch("junk.pdf")
+
+        report = archive_mod.verify_archive(self.tmp)
+        self.assertEqual(report["unindexed_sidecars"], ["inv-1.json"])
+        self.assertEqual(archive_mod.deletable_orphans(report), ["junk.pdf"])
+
+        result = CliRunner().invoke(
+            cli, ["verify", "--target", self.tmp, "--delete-orphans", "--yes"]
+        )
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("Re-run `archive`", result.output)
+        self.assertTrue(os.path.exists(os.path.join(self.files, "inv-1.json")))
+        self.assertTrue(os.path.exists(os.path.join(self.files, "inv-1.pdf")))
+        self.assertFalse(os.path.exists(os.path.join(self.files, "junk.pdf")))
+
+    def test_count_issues(self):
+        self._write_manifest([{"id": "9", "pdf": "files/gone.pdf", "json": "files/gone.json"}])
+        self._touch("stray.pdf")
+        report = archive_mod.verify_archive(self.tmp)
+        # missing_pdf + missing_json + orphan_pdf + unpaired_pdf
+        self.assertEqual(archive_mod.count_issues(report), 4)
 
     def test_detects_unpaired_pdf(self):
         self._write_manifest([])
@@ -388,6 +432,51 @@ class TestVerifyArchive(unittest.TestCase):
                 )
         self.assertEqual(result.exit_code, 0, result.output)
         MockClient.assert_called_once_with(api_token="test-token")
+
+    def test_cli_backfill_with_yes(self):
+        self._write_sidecar("inv-1.json", sevdesk_id="1")
+        self._touch("inv-1.pdf", b"%PDF")
+        self._write_manifest(
+            [{"id": "1", "type": "Invoice", "pdf": "files/inv-1.pdf", "json": "files/inv-1.json"}]
+        )
+
+        result = CliRunner().invoke(
+            cli, ["verify", "--target", self.tmp, "--backfill-hashes", "--yes"]
+        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("updated=1", result.output)
+        self.assertIn("1 verified", result.output)
+
+    def test_cli_backfill_cancelled_without_confirmation(self):
+        self._write_manifest([])
+        result = CliRunner().invoke(
+            cli, ["verify", "--target", self.tmp, "--backfill-hashes"], input="no\n"
+        )
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("Cancelled", result.output)
+
+    def test_cli_archive_exits_nonzero_on_error_events(self):
+        runner = CliRunner()
+        with patch("sevdesk_archiver.cli.SevDeskClient") as MockClient:
+            MockClient.return_value.get_invoices.side_effect = RuntimeError("down")
+            MockClient.return_value.get_credit_notes.return_value = []
+            result = runner.invoke(
+                cli,
+                [
+                    "archive", "--target", self.tmp, "--api-token", "t",
+                    "--after", "2026-02-01", "--end", "2026-02-28",
+                ],
+            )
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("Fetch failed", result.output)
+
+    def test_cli_serve_rejects_missing_dir(self):
+        result = CliRunner().invoke(
+            cli, ["serve", "--target", os.path.join(self.tmp, "nope")]
+        )
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("is not a directory", result.output)
 
     def test_cli_archive_errors_without_token(self):
         runner = CliRunner()

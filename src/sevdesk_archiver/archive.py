@@ -21,12 +21,16 @@ import re
 import shutil
 import time
 from calendar import monthrange
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Generator, Iterator, List, Optional, Tuple
 
 import requests
 
-from .exceptions import DocumentNotFoundError, RateLimitExceededError
+from .exceptions import (
+    AuthenticationError,
+    DocumentNotFoundError,
+    RateLimitExceededError,
+)
 from .utils import format_date
 
 _TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "templates")
@@ -80,12 +84,20 @@ _UNSAFE_FILENAME_CHARS = re.compile(r'[:*?"<>|]')
 _WHITESPACE = re.compile(r"\s+")
 
 
+_DATE_FIELD = {
+    "Invoice": "invoiceDate",
+    "CreditNote": "creditNoteDate",
+    "Voucher": "voucherDate",
+}
+_FETCH_METHOD = {
+    "Invoice": "get_invoices",
+    "CreditNote": "get_credit_notes",
+    "Voucher": "get_vouchers",
+}
+
+
 def _date_field_for(doc_type: str) -> str:
-    return {
-        "Invoice": "invoiceDate",
-        "CreditNote": "creditNoteDate",
-        "Voucher": "voucherDate",
-    }[doc_type]
+    return _DATE_FIELD[doc_type]
 
 
 def _number_for(doc: Dict[str, Any], doc_type: str) -> str:
@@ -118,8 +130,7 @@ def _receiver_for(doc: Dict[str, Any], doc_type: str) -> str:
         return name
     sur = str(party.get("surename") or "").strip()
     fam = str(party.get("familyname") or "").strip()
-    combined = f"{sur} {fam}".strip()
-    return combined
+    return f"{sur} {fam}".strip()
 
 
 def _clean_for_filename(value: str, max_len: int = _RECEIVER_MAX_LEN) -> str:
@@ -154,6 +165,13 @@ def _sidecar_path(pdf_path: str) -> str:
     return pdf_path[:-4] + ".json" if pdf_path.endswith(".pdf") else pdf_path + ".json"
 
 
+def _pdf_filename_for(entry: Dict[str, Any]) -> str:
+    """PDF basename owned by a ``scan_existing`` entry (frozen filename)."""
+    if entry.get("pdf"):
+        return os.path.basename(entry["pdf"])
+    return os.path.basename(entry["json"])[:-5] + ".pdf"
+
+
 def _files_dir(target_dir: str) -> str:
     return os.path.join(target_dir, FILES_SUBDIR)
 
@@ -170,20 +188,45 @@ def _hash_file(path: str) -> str:
     return f"{HASH_PREFIX}{h.hexdigest()}"
 
 
+TMP_SUFFIX = ".tmp"
+
+
 def _atomic_write_bytes(path: str, data: bytes) -> None:
-    """Write via a sibling .tmp file + os.replace so a crash mid-write can
-    never leave a truncated file at the final path."""
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, path)
+    """Write via a sibling .tmp file + fsync + os.replace so a crash or power
+    loss mid-write can never leave a truncated file at the final path."""
+    tmp = path + TMP_SUFFIX
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
-    os.replace(tmp, path)
+    data = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    _atomic_write_bytes(path, data.encode("utf-8"))
+
+
+def _remove_stale_tmp_files(files_dir: str) -> int:
+    """Delete leftover ``*.tmp`` files from a previously killed run."""
+    removed = 0
+    if not os.path.isdir(files_dir):
+        return removed
+    for name in os.listdir(files_dir):
+        if name.endswith(TMP_SUFFIX):
+            try:
+                os.remove(os.path.join(files_dir, name))
+                removed += 1
+            except OSError:
+                pass
+    return removed
 
 
 _SIDECAR_REQUIRED_KEYS = (
@@ -299,7 +342,11 @@ def _write_sidecar(
 
 
 def _sidecar_equivalent(meta: Dict[str, Any], doc: Dict[str, Any]) -> bool:
-    return meta.get("document") == doc
+    """True if the stored document matches ``doc``, ignoring our own
+    ``_no_pdf`` marker (which fresh API data never carries)."""
+    stored = dict(meta.get("document") or {})
+    stored.pop("_no_pdf", None)
+    return stored == doc
 
 
 def _iter_month_ranges(after_date: str, end_date: str) -> Iterator[Tuple[str, str]]:
@@ -323,19 +370,12 @@ def _iter_month_ranges(after_date: str, end_date: str) -> Iterator[Tuple[str, st
 def _fetch_month(
     client, doc_type: str, month_start: str, month_end: str, status: Optional[str]
 ) -> List[Dict[str, Any]]:
-    if doc_type == "Invoice":
-        return client.get_invoices(
-            status=status, limit=10000, after_date=month_start, end_date=month_end
-        )
-    if doc_type == "CreditNote":
-        return client.get_credit_notes(
-            status=status, limit=10000, after_date=month_start, end_date=month_end
-        )
-    if doc_type == "Voucher":
-        return client.get_vouchers(
-            status=status, limit=10000, after_date=month_start, end_date=month_end
-        )
-    raise ValueError(f"Unknown document type: {doc_type}")
+    method = _FETCH_METHOD.get(doc_type)
+    if method is None:
+        raise ValueError(f"Unknown document type: {doc_type}")
+    return getattr(client, method)(
+        status=status, limit=10000, after_date=month_start, end_date=month_end
+    )
 
 
 MAX_RETRIES_PER_CALL = 3
@@ -505,6 +545,7 @@ def verify_archive(target_dir: str, check_hashes: bool = True) -> Dict[str, Any]
         "hash_mismatches": [],
         "hash_verified": 0,
         "hash_unverified": 0,
+        "unindexed_sidecars": [],
         "errors": [],
     }
 
@@ -632,13 +673,48 @@ def verify_archive(target_dir: str, check_hashes: bool = True) -> Dict[str, Any]
             else:
                 out["hash_unverified"] += 1
 
-    for name in on_disk:
+    for name in sorted(on_disk):
         if name.endswith(".pdf") and name not in referenced_pdfs:
             out["orphan_pdf"].append(name)
         elif name.endswith(".json") and name not in referenced_jsons:
             out["orphan_json"].append(name)
+            # A readable sidecar with an id is real archive data that the
+            # manifest simply doesn't list yet (e.g. a run killed before
+            # write_manifest). Re-running `archive` re-indexes it.
+            if name in sidecars and sidecars[name].get("sevdesk_id"):
+                out["unindexed_sidecars"].append(name)
 
     return out
+
+
+_ISSUE_KEYS = (
+    "missing_pdf",
+    "missing_json",
+    "orphan_pdf",
+    "orphan_json",
+    "unpaired_pdf",
+    "unpaired_json",
+    "sidecar_errors",
+    "manifest_sidecar_mismatches",
+    "duplicate_sevdesk_ids",
+    "hash_mismatches",
+)
+
+
+def count_issues(report: Dict[str, Any]) -> int:
+    """Total number of inconsistencies in a ``verify_archive`` report
+    (not counting top-level ``errors``)."""
+    return sum(len(report[k]) for k in _ISSUE_KEYS)
+
+
+def deletable_orphans(report: Dict[str, Any]) -> List[str]:
+    """Orphan files that are safe to delete: excludes sidecars that are
+    merely missing from a stale manifest, and their sibling PDFs."""
+    protected = set(report["unindexed_sidecars"])
+    protected |= {n[:-5] + ".pdf" for n in protected}
+    return [
+        n for n in report["orphan_pdf"] + report["orphan_json"] if n not in protected
+    ]
 
 
 def backfill_sidecar_hashes(target_dir: str) -> Dict[str, int]:
@@ -736,14 +812,8 @@ def install_serve_scripts(target_dir: str) -> List[str]:
 
 def _default_after() -> str:
     """Default start date: 1st of previous month."""
-    today = datetime.now()
-    first_of_this = today.replace(day=1)
-    last_of_prev = first_of_this.replace(day=1)
-    if first_of_this.month == 1:
-        first_of_prev = last_of_prev.replace(year=first_of_this.year - 1, month=12)
-    else:
-        first_of_prev = last_of_prev.replace(month=first_of_this.month - 1)
-    return first_of_prev.strftime("%Y-%m-%d")
+    last_of_prev = datetime.now().replace(day=1) - timedelta(days=1)
+    return last_of_prev.replace(day=1).strftime("%Y-%m-%d")
 
 
 def archive(
@@ -762,9 +832,9 @@ def archive(
     Self-correcting: writes whichever of (PDF, JSON) is missing; skips when both
     are present and the JSON already matches the current document metadata.
     """
-    os.makedirs(target_dir, exist_ok=True)
     files_dir = _files_dir(target_dir)
-    os.makedirs(files_dir, exist_ok=True)
+    if not dry_run:
+        os.makedirs(files_dir, exist_ok=True)
 
     effective_after = after_date or _default_after()
     effective_end = end_date or datetime.now().strftime("%Y-%m-%d")
@@ -778,12 +848,19 @@ def archive(
         "message": f"Date range: {effective_after} .. {effective_end}",
     }
 
-    moved = migrate_flat_to_subdir(target_dir)
-    if moved:
-        yield {
-            "type": "info",
-            "message": f"Migrated {moved} file(s) from archive root into {FILES_SUBDIR}/",
-        }
+    if not dry_run:
+        moved = migrate_flat_to_subdir(target_dir)
+        if moved:
+            yield {
+                "type": "info",
+                "message": f"Migrated {moved} file(s) from archive root into {FILES_SUBDIR}/",
+            }
+        stale = _remove_stale_tmp_files(files_dir)
+        if stale:
+            yield {
+                "type": "info",
+                "message": f"Removed {stale} leftover temp file(s) from an interrupted run",
+            }
 
     index = scan_existing(target_dir)
     yield {
@@ -794,13 +871,7 @@ def archive(
     # PDF basenames already owned by an indexed document. Used to detect two
     # different documents generating the same filename (e.g. two vouchers with
     # identical date/description/supplier and no voucher number).
-    claimed_filenames: set = set()
-    for entry in index.values():
-        claimed_filenames.add(
-            os.path.basename(entry["pdf"])
-            if entry.get("pdf")
-            else os.path.basename(entry["json"])[:-5] + ".pdf"
-        )
+    claimed_filenames = {_pdf_filename_for(entry) for entry in index.values()}
 
     doc_types = ["Invoice"]
     if include_credit_notes:
@@ -833,6 +904,9 @@ def archive(
                     st=status: _fetch_month(client, dt, ms, me, st),
                     label=f"fetch {doc_type} {month_start[:7]}",
                 )
+            except AuthenticationError as e:
+                yield {"type": "error", "message": f"Aborting: {e}"}
+                return
             except Exception as e:
                 yield {
                     "type": "error",
@@ -873,11 +947,7 @@ def archive(
 
                 existing = index.get(sev_id)
                 if existing is not None:
-                    pdf_filename = (
-                        os.path.basename(existing["pdf"])
-                        if existing.get("pdf")
-                        else os.path.basename(existing["json"])[:-5] + ".pdf"
-                    )
+                    pdf_filename = _pdf_filename_for(existing)
                 else:
                     pdf_filename = generate_archive_filename(doc, doc_type)
                     if pdf_filename in claimed_filenames:
@@ -945,10 +1015,18 @@ def archive(
                     except DocumentNotFoundError:
                         totals["no_pdf"] += 1
                         doc["_no_pdf"] = True
+                        # Only rewrite if the sidecar doesn't already carry the
+                        # marker — avoids churning archived_at on every run.
+                        prev_doc = (existing or {}).get("meta", {}).get("document")
+                        if not (prev_doc or {}).get("_no_pdf"):
+                            need_json = True
                         yield {
                             "type": "info",
                             "message": f"  ⊘ no PDF on SevDesk for {doc_type} {sev_id}",
                         }
+                    except AuthenticationError as e:
+                        yield {"type": "error", "message": f"Aborting: {e}"}
+                        return
                     except Exception as e:
                         totals["errors"] += 1
                         yield {
@@ -998,9 +1076,7 @@ def archive(
             meta = entry.get("meta", {})
             doc = meta.get("document") or {}
             doc_type = entry.get("doc_type", "Invoice")
-            pdf_filename = meta.get("pdf_filename") or os.path.basename(
-                entry["json"].replace(".json", ".pdf")
-            )
+            pdf_filename = meta.get("pdf_filename") or _pdf_filename_for(entry)
             manifest_entries.append(_manifest_entry(doc, doc_type, pdf_filename))
 
     if not dry_run:

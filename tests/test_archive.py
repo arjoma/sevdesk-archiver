@@ -782,6 +782,180 @@ class TestArchiveFlow(unittest.TestCase):
         self.assertEqual(manifest["count"], 1)
         self.assertEqual(manifest["entries"][0]["id"], "1")
 
+    def _run(self, client, **kw):
+        kw.setdefault("after_date", "2026-02-01")
+        kw.setdefault("end_date", "2026-02-28")
+        return list(archive_mod.archive(client=client, target_dir=self.tmp, **kw))
+
+    def test_dry_run_on_new_target_creates_nothing(self):
+        target = os.path.join(self.tmp, "fresh")
+        client = self._mk_client([self._doc()])
+
+        list(
+            archive_mod.archive(
+                client=client,
+                target_dir=target,
+                after_date="2026-02-01",
+                end_date="2026-02-28",
+                dry_run=True,
+            )
+        )
+
+        self.assertFalse(os.path.exists(target))
+
+    def test_dry_run_does_not_migrate_flat_files(self):
+        flat = os.path.join(self.tmp, "inv-old.pdf")
+        with open(flat, "wb") as f:
+            f.write(b"%PDF")
+
+        self._run(self._mk_client([]), dry_run=True)
+
+        self.assertTrue(os.path.exists(flat))
+
+    def _voucher(self):
+        return {
+            "id": "42",
+            "voucherDate": "2026-02-10",
+            "description": "Manual entry",
+            "supplier": {"name": "Acme"},
+            "status": "1000",
+        }
+
+    def _no_pdf_client(self):
+        from sevdesk_archiver.exceptions import DocumentNotFoundError
+
+        client = self._mk_client([])
+        client.get_vouchers.side_effect = lambda **kw: [self._voucher()]
+        client.download_document.side_effect = DocumentNotFoundError("Voucher", "42")
+        return client
+
+    def _only_sidecar(self):
+        (name,) = [n for n in os.listdir(self.files) if n.endswith(".json")]
+        with open(os.path.join(self.files, name), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_no_pdf_sidecar_is_not_rewritten_every_run(self):
+        client = self._no_pdf_client()
+        self._run(client, include_vouchers=True)
+        first = self._only_sidecar()
+        self.assertTrue(first["document"]["_no_pdf"])
+
+        events = self._run(client, include_vouchers=True)
+
+        self.assertEqual(self._only_sidecar()["archived_at"], first["archived_at"])
+        self.assertIn("NoPdf=1", events[-1]["message"])
+        with open(os.path.join(self.tmp, "manifest.json"), encoding="utf-8") as f:
+            self.assertTrue(json.load(f)["entries"][0]["no_pdf"])
+
+    def test_no_pdf_marker_survives_transient_download_failure(self):
+        client = self._no_pdf_client()
+        self._run(client, include_vouchers=True)
+
+        client.download_document.side_effect = RuntimeError("503")
+        self._run(client, include_vouchers=True)
+
+        self.assertTrue(self._only_sidecar()["document"]["_no_pdf"])
+
+    def test_no_pdf_marker_cleared_when_pdf_appears(self):
+        client = self._no_pdf_client()
+        self._run(client, include_vouchers=True)
+
+        client.download_document.side_effect = None
+        client.download_document.return_value = (b"%PDF-late", "x.pdf")
+        self._run(client, include_vouchers=True)
+
+        meta = self._only_sidecar()
+        self.assertNotIn("_no_pdf", meta["document"])
+        self.assertTrue(meta["pdf_hash"].startswith("sha256:"))
+
+    def test_authentication_error_aborts_run(self):
+        from sevdesk_archiver.exceptions import AuthenticationError
+
+        client = self._mk_client([])
+        client.get_invoices.side_effect = AuthenticationError("401")
+
+        events = self._run(client, after_date="2026-01-01", end_date="2026-03-31")
+
+        errors = [e for e in events if e["type"] == "error"]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Aborting", errors[0]["message"])
+        self.assertEqual(client.get_invoices.call_count, 1)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "manifest.json")))
+
+    def test_authentication_error_on_download_aborts_run(self):
+        from sevdesk_archiver.exceptions import AuthenticationError
+
+        client = self._mk_client([self._doc("1"), self._doc("2", number="RE-2")])
+        client.download_document.side_effect = AuthenticationError("401")
+
+        events = self._run(client)
+
+        self.assertEqual(client.download_document.call_count, 1)
+        self.assertIn("Aborting", events[-1]["message"])
+
+    def test_failed_month_fetch_keeps_existing_docs_in_manifest(self):
+        client = self._mk_client([self._doc()])
+        self._run(client)
+
+        client.get_invoices.side_effect = RuntimeError("500")
+        events = self._run(client)
+
+        self.assertTrue(any(e["type"] == "error" for e in events))
+        with open(os.path.join(self.tmp, "manifest.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["count"], 1)
+
+    def test_stale_tmp_files_are_removed(self):
+        os.makedirs(self.files)
+        stale = os.path.join(self.files, "inv-x.pdf.tmp")
+        with open(stale, "wb") as f:
+            f.write(b"%PDF-trunc")
+
+        events = self._run(self._mk_client([]))
+
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(any("leftover temp" in e["message"] for e in events))
+
+
+class TestAtomicWrite(unittest.TestCase):
+    def setUp(self):
+        self.tmp = os.path.join(os.path.dirname(__file__), "_tmp_atomic")
+        os.makedirs(self.tmp, exist_ok=True)
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmp)
+
+    def test_failed_write_leaves_no_tmp_and_keeps_old_file(self):
+        path = os.path.join(self.tmp, "a.pdf")
+        archive_mod._atomic_write_bytes(path, b"old")
+
+        with unittest.mock.patch(
+            "sevdesk_archiver.archive.os.replace", side_effect=OSError("disk full")
+        ):
+            with self.assertRaises(OSError):
+                archive_mod._atomic_write_bytes(path, b"new")
+
+        self.assertEqual(os.listdir(self.tmp), ["a.pdf"])
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"old")
+
+
+class TestDefaultAfter(unittest.TestCase):
+    def _at(self, y, m, d):
+        from datetime import datetime
+
+        fake = unittest.mock.MagicMock(wraps=datetime)
+        fake.now.return_value = datetime(y, m, d, 12, 0)
+        with unittest.mock.patch("sevdesk_archiver.archive.datetime", fake):
+            return archive_mod._default_after()
+
+    def test_mid_year(self):
+        self.assertEqual(self._at(2026, 3, 31), "2026-02-01")
+
+    def test_january_wraps_to_previous_december(self):
+        self.assertEqual(self._at(2026, 1, 15), "2025-12-01")
+
 
 class TestRetryBehavior(unittest.TestCase):
     def setUp(self):
@@ -904,6 +1078,33 @@ class TestRetryBehavior(unittest.TestCase):
         with open(os.path.join(self.tmp, "manifest.json"), encoding="utf-8") as f:
             mf = json.load(f)
         self.assertEqual(mf["entries"][0]["no_pdf"], True)
+
+    def test_connection_error_on_download_is_retried(self):
+        from requests.exceptions import ConnectionError as ReqConnectionError
+
+        client = MagicMock()
+        client.get_invoices.return_value = [
+            {"id": "1", "invoiceNumber": "RE-1", "invoiceDate": "2026-02-10", "status": "200"}
+        ]
+        client.get_credit_notes.return_value = []
+        client.download_document.side_effect = [
+            ReqConnectionError("reset"),
+            (b"%PDF", "x.pdf"),
+        ]
+
+        with unittest.mock.patch("sevdesk_archiver.archive.time.sleep") as sleep:
+            events = list(
+                archive_mod.archive(
+                    client=client,
+                    target_dir=self.tmp,
+                    after_date="2026-02-01",
+                    end_date="2026-02-28",
+                )
+            )
+
+        sleep.assert_called_once_with(archive_mod.NETWORK_BACKOFF_BASE)
+        self.assertIn("Downloaded=1", events[-1]["message"])
+        self.assertIn("Errors=0", events[-1]["message"])
 
     def test_rate_limit_gives_up_after_max_retries(self):
         from sevdesk_archiver.exceptions import RateLimitExceededError

@@ -12,9 +12,14 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 from requests.exceptions import ConnectionError as ReqConnectionError
-from requests.exceptions import HTTPError, RetryError
+from requests.exceptions import HTTPError, RetryError, Timeout
 
-from sevdesk_archiver.exceptions import DocumentNotFoundError, RateLimitExceededError
+from sevdesk_archiver.exceptions import (
+    AuthenticationError,
+    DocumentNotFoundError,
+    RateLimitExceededError,
+    SevDeskAPIError,
+)
 from sevdesk_archiver.sevdesk import SevDeskClient
 from sevdesk_archiver.utils import parse_retry_after
 
@@ -257,6 +262,18 @@ class TestDownloadDocument(unittest.TestCase):
         self.assertEqual(content, b"plain text")
         self.assertEqual(filename, "note.txt")
 
+    def test_pdf_content_type_with_parameters(self):
+        session = MagicMock()
+        session.get.return_value = _response(
+            content=b"%PDF-1.7", content_type="application/pdf; charset=binary"
+        )
+        client = _client_with(session)
+
+        content, _ = client.download_document("9", object_type="CreditNote")
+
+        self.assertEqual(content, b"%PDF-1.7")
+        self.assertIn("/CreditNote/9/getPdf", session.get.call_args[0][0])
+
     def test_filename_is_sanitized(self):
         payload = {
             "content": base64.b64encode(b"x").decode(),
@@ -338,16 +355,52 @@ class TestErrorMapping(unittest.TestCase):
         self.assertNotIsInstance(ctx.exception, RateLimitExceededError)
         self.assertIn("failed after retries", str(ctx.exception))
 
+    def test_other_http_error_is_sevdesk_api_error(self):
+        session = MagicMock()
+        session.get.return_value = _response(status_code=500)
+        client = _client_with(session)
+
+        with self.assertRaises(SevDeskAPIError):
+            client.download_document("1")
+
     def test_connection_error_propagates_for_caller_backoff(self):
-        """Connection errors surface as the client's generic wrapper
-        exception with the original chained as __cause__."""
+        """Connection errors are re-raised untouched so archive's
+        _with_retry can back off and retry them."""
         session = MagicMock()
         session.get.side_effect = ReqConnectionError("boom")
         client = _client_with(session)
 
-        with self.assertRaises(Exception) as ctx:
+        with self.assertRaises(ReqConnectionError):
             client.get_invoices()
-        self.assertIsInstance(ctx.exception.__cause__, ReqConnectionError)
+
+    def test_timeout_propagates_for_caller_backoff(self):
+        session = MagicMock()
+        session.get.side_effect = Timeout("slow")
+        client = _client_with(session)
+
+        with self.assertRaises(Timeout):
+            client.download_document("1")
+
+    def test_401_maps_to_authentication_error(self):
+        for code in (401, 403):
+            session = MagicMock()
+            session.get.return_value = _response(status_code=code)
+            client = _client_with(session)
+
+            with self.assertRaises(AuthenticationError):
+                client.get_invoices()
+            with self.assertRaises(AuthenticationError):
+                client.download_document("1")
+
+
+class TestRetrySession(unittest.TestCase):
+    def test_exhausted_retries_return_final_response(self):
+        """raise_on_status=False: after retries the real status code reaches
+        raise_for_status (429 keeps its Retry-After; 5xx is not a rate limit)."""
+        client = SevDeskClient(api_token="t")
+        retry = client.session.get_adapter("https://my.sevdesk.de").max_retries
+        self.assertFalse(retry.raise_on_status)
+        self.assertIn(429, retry.status_forcelist)
 
 
 class TestParseRetryAfter(unittest.TestCase):

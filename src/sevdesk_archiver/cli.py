@@ -53,7 +53,7 @@ def cli(log_file, verbose):
 
 
 @cli.command()
-@click.option("--target", help="Archive directory (default: $ARCHIVE_TARGET, or '.' falls back to the current directory)")
+@click.option("--target", help="Archive directory (default: $ARCHIVE_TARGET)")
 @click.option(
     "--api-token",
     "api_token",
@@ -251,11 +251,16 @@ def verify(target, output_format, delete_orphans, yes, no_hashes, backfill_hashe
 
     report = archive_mod.verify_archive(target_dir, check_hashes=not no_hashes)
 
+    issues = archive_mod.count_issues(report)
+
     if output_format == "json":
         serializable = {
             k: (sorted(v) if isinstance(v, set) else v) for k, v in report.items()
         }
+        serializable["issue_count"] = issues
         click.echo(json.dumps(serializable, indent=2, default=str))
+        if issues or report["errors"]:
+            sys.exit(1)
         return
 
     click.echo(f"[*] Archive: {target_dir}")
@@ -324,18 +329,6 @@ def verify(target, output_format, delete_orphans, yes, no_hashes, backfill_hashe
         ]
         _list("PDF hash mismatches (bit rot / tampering)", items, "red")
 
-    issues = (
-        len(report["missing_pdf"])
-        + len(report["missing_json"])
-        + len(report["orphan_pdf"])
-        + len(report["orphan_json"])
-        + len(report["unpaired_pdf"])
-        + len(report["unpaired_json"])
-        + len(report["sidecar_errors"])
-        + len(report["manifest_sidecar_mismatches"])
-        + len(report["duplicate_sevdesk_ids"])
-        + len(report["hash_mismatches"])
-    )
     if issues == 0:
         click.echo(click.style("\n✓ Archive is consistent.", fg="green", bold=True))
         return
@@ -344,8 +337,18 @@ def verify(target, output_format, delete_orphans, yes, no_hashes, backfill_hashe
         click.style(f"\n⚠ {issues} inconsistencies found.", fg="yellow", bold=True)
     )
 
-    if delete_orphans and (report["orphan_pdf"] or report["orphan_json"]):
-        to_delete = report["orphan_pdf"] + report["orphan_json"]
+    if report["unindexed_sidecars"]:
+        click.echo(
+            click.style(
+                f"\n{len(report['unindexed_sidecars'])} valid sidecar(s) are missing "
+                "from manifest.json (interrupted run?). Re-run `archive` to rebuild "
+                "the manifest; --delete-orphans will not touch them.",
+                fg="yellow",
+            )
+        )
+
+    to_delete = archive_mod.deletable_orphans(report)
+    if delete_orphans and to_delete:
         click.echo(
             click.style(
                 f"\nAbout to delete {len(to_delete)} orphan file(s) from {target_dir}/files/",
