@@ -1,22 +1,40 @@
 import logging
 import os
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from logging.handlers import RotatingFileHandler
-from typing import Any, Optional, cast
+from typing import Any, Mapping, Optional, Protocol, cast
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-def parse_retry_after(response: requests.Response) -> Optional[int]:
-    """Parse the Retry-After header. Returns seconds (int) or None."""
+class _HasHeaders(Protocol):
+    @property
+    def headers(self) -> Mapping[str, str]: ...
+
+
+def parse_retry_after(response: _HasHeaders) -> Optional[int]:
+    """Parse the Retry-After header into seconds, or None.
+
+    Accepts any response object with a ``headers`` mapping (requests, httpx,
+    ...). Handles both delay-seconds and HTTP-date forms (RFC 9110).
+    """
     retry_after = response.headers.get("Retry-After")
-    if retry_after:
-        try:
-            return int(retry_after)
-        except ValueError:
-            pass
-    return None
+    if not retry_after:
+        return None
+    try:
+        return max(0, int(retry_after))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(retry_after)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0, int((when - datetime.now(timezone.utc)).total_seconds()))
 
 
 def create_retry_session(
@@ -26,11 +44,13 @@ def create_retry_session(
     allowed_methods: Optional[list] = None,
     session: Optional[requests.Session] = None,
 ) -> requests.Session:
-    """Create or configure a requests Session with automatic retries."""
-    session = session or requests.Session()
+    """Create or configure a requests Session with automatic retries.
 
-    if allowed_methods is None:
-        allowed_methods = ["HEAD", "GET", "PUT", "DELETE", "OPTIONS", "TRACE", "POST"]
+    By default only idempotent methods are retried (urllib3's default set,
+    which excludes POST/PATCH) — retrying a POST after a 5xx can create
+    duplicates on the server. Pass ``allowed_methods`` to override.
+    """
+    session = session or requests.Session()
 
     retry = Retry(
         total=retries,
@@ -38,7 +58,9 @@ def create_retry_session(
         connect=retries,
         backoff_factor=backoff_factor,
         status_forcelist=status_forcelist,
-        allowed_methods=allowed_methods,
+        allowed_methods=(
+            Retry.DEFAULT_ALLOWED_METHODS if allowed_methods is None else allowed_methods
+        ),
         # Return the final response instead of raising RetryError, so callers
         # see the real status code (429 with Retry-After vs. a persistent 5xx)
         # rather than every exhausted retry looking like a rate limit.
@@ -140,6 +162,7 @@ def format_date(date_val: Any) -> str:
         and s_val[5:7].isdigit()
         and s_val[7] == "-"
         and s_val[8:10].isdigit()
+        and not s_val[10:11].isdigit()
     ):
         return s_val[:10]
     return s_val

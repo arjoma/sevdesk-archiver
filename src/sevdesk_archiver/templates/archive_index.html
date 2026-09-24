@@ -1379,7 +1379,10 @@ const TWEAK_DEFAULTS = {
       if (!state.entries.length) {
         empty.appendChild(el("div", { class: "title", text: "Kein Archiv gefunden" }));
         empty.appendChild(document.createTextNode("Bitte über HTTP öffnen, z.B. mit "));
-        empty.appendChild(el("code", { text: "sevdesk-archiver serve" }));
+        empty.appendChild(el("code", { text: "./serve-archive.sh" }));
+        empty.appendChild(document.createTextNode(" oder "));
+        empty.appendChild(el("code", { text: "python3 serve.py" }));
+        empty.appendChild(document.createTextNode(" im Archivordner"));
         empty.appendChild(el("br"));
         empty.appendChild(el("code", { text: "manifest.json" }));
         empty.appendChild(document.createTextNode(" konnte nicht geladen werden."));

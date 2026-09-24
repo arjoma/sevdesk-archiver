@@ -130,7 +130,12 @@ def archive(target, api_token, after, end_date, status, credit_notes, vouchers, 
 @cli.command()
 @click.option("--target", help="Archive directory (default: $ARCHIVE_TARGET)")
 @click.option("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
-@click.option("--port", default=8765, type=int, help="Bind port (default: 8765)")
+@click.option(
+    "--port",
+    default=8765,
+    type=click.IntRange(1, 65535),
+    help="Bind port (default: 8765)",
+)
 @click.option("--no-browser", is_flag=True, help="Do not auto-open the browser")
 def serve(target, host, port, no_browser):
     """Serve the archive over HTTP so the index.html viewer works.
@@ -155,16 +160,33 @@ def serve(target, host, port, no_browser):
     archive_mod.install_logo(target_dir)
     archive_mod.install_serve_scripts(target_dir)
 
+    class Server(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
     handler = partial(http.server.SimpleHTTPRequestHandler, directory=target_dir)
     try:
-        httpd = socketserver.ThreadingTCPServer((host, port), handler)
+        httpd = Server((host, port), handler)
     except OSError as e:
         click.echo(click.style(f"Error binding {host}:{port}: {e}", fg="red"), err=True)
         sys.exit(1)
 
-    url = f"http://{host}:{port}/index.html"
+    wildcard = host in ("0.0.0.0", "::", "")
+    url_host = "127.0.0.1" if wildcard else host
+    url = f"http://{url_host}:{port}/index.html"
     click.echo(click.style(f"Serving {target_dir}", fg="cyan"))
     click.echo(click.style(f"Open: {url}", fg="green", bold=True))
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        where = "every network interface" if wildcard else host
+        click.echo(
+            click.style(
+                f"WARNING: listening on {where} — anyone who can reach port {port} "
+                "can read the whole archive. There is no authentication.",
+                fg="yellow",
+                bold=True,
+            ),
+            err=True,
+        )
     click.echo("Press Ctrl+C to stop.")
 
     if not no_browser:
@@ -320,7 +342,10 @@ def verify(target, output_format, delete_orphans, yes, no_hashes, backfill_hashe
         ]
         _list("Manifest↔sidecar mismatches", items, "red")
     if report["duplicate_sevdesk_ids"]:
-        items = [f"id={d['id']}: {', '.join(d['files'])}" for d in report["duplicate_sevdesk_ids"]]
+        items = [
+            f"{d.get('type', '?')} id={d['id']}: {', '.join(d['files'])}"
+            for d in report["duplicate_sevdesk_ids"]
+        ]
         _list("Duplicate sevdesk_ids across sidecars", items, "red")
     if report["hash_mismatches"]:
         items = [

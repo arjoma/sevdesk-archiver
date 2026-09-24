@@ -478,6 +478,64 @@ class TestVerifyArchive(unittest.TestCase):
         self.assertEqual(result.exit_code, 1)
         self.assertIn("is not a directory", result.output)
 
+    def _serve(self, *args):
+        with patch(
+            "socketserver.BaseServer.serve_forever", side_effect=KeyboardInterrupt
+        ):
+            return CliRunner().invoke(
+                cli, ["serve", "--target", self.tmp, "--no-browser", "--port", "0", *args]
+            )
+
+    def test_cli_serve_rejects_invalid_port(self):
+        result = self._serve()
+        self.assertEqual(result.exit_code, 2)
+
+    def test_cli_serve_warns_when_exposed(self):
+        import socket
+
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = str(s.getsockname()[1])
+        with patch(
+            "socketserver.BaseServer.serve_forever", side_effect=KeyboardInterrupt
+        ):
+            local = CliRunner().invoke(
+                cli, ["serve", "--target", self.tmp, "--no-browser", "--port", port]
+            )
+            exposed = CliRunner().invoke(
+                cli,
+                ["serve", "--target", self.tmp, "--no-browser", "--port", port,
+                 "--host", "0.0.0.0"],
+            )
+        self.assertEqual(local.exit_code, 0, local.output)
+        self.assertNotIn("WARNING", local.output)
+        self.assertEqual(exposed.exit_code, 0, exposed.output)
+        self.assertIn("WARNING", exposed.output)
+        self.assertIn(f"http://127.0.0.1:{port}/index.html", exposed.output)
+
+    def test_standalone_serve_py_rejects_invalid_port(self):
+        import subprocess
+        import sys
+
+        script = os.path.join(
+            os.path.dirname(archive_mod.__file__), "templates", "serve.py"
+        )
+        proc = subprocess.run(
+            [sys.executable, script, "notaport"], capture_output=True, text=True
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("Invalid port", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_duplicate_ids_are_per_type(self):
+        self._write_sidecar("a.json", sevdesk_id="1", doc_type="Invoice")
+        self._write_sidecar("b.json", sevdesk_id="1", doc_type="Voucher")
+        self._write_sidecar("c.json", sevdesk_id="1", doc_type="Invoice")
+        self._write_manifest([])
+
+        dups = archive_mod.verify_archive(self.tmp)["duplicate_sevdesk_ids"]
+        self.assertEqual(dups, [{"id": "1", "type": "Invoice", "files": ["a.json", "c.json"]}])
+
     def test_cli_archive_errors_without_token(self):
         runner = CliRunner()
         env = {k: v for k, v in os.environ.items() if k != "SEVDESK_API_TOKEN"}
