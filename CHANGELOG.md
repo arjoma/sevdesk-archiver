@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-24
+
 ### Added
 - README section on running headless (cron / systemd): periodic full-history sweep to catch backdated or late-booked documents, `flock` against overlapping runs, version pinning, and keeping the API token outside the archive directory.
 - Filename collision handling: when two different documents generate the same archive filename (e.g. two vouchers with identical date, description, and supplier), the later one gets `-<sevdesk_id>` appended instead of being silently skipped and never downloaded.
@@ -65,6 +67,7 @@ First public release.
 - GitHub Actions CI (pytest, ruff, mypy on Python 3.13 via uv).
 - GitHub Actions release workflow: PyPI publish via trusted publishing on `v*.*.*` tags, with tag-vs-pyproject version verification and automatic GitHub Release creation.
 
-[Unreleased]: https://github.com/arjoma/sevdesk-archiver/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/arjoma/sevdesk-archiver/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/arjoma/sevdesk-archiver/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/arjoma/sevdesk-archiver/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/arjoma/sevdesk-archiver/releases/tag/v0.1.0
